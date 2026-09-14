@@ -1,0 +1,11 @@
+' =====================================================================
+'  Paste this into ThisOutlookSession (NOT a regular module).
+'  Application_ItemSend only fires from ThisOutlookSession.
+'
+'  If you already have an Application_ItemSend, just add the
+'  CheckReplyAll line to the one you have.
+' =====================================================================
+
+Private Sub Application_ItemSend(ByVal Item As Object, Cancel As Boolean)
+    modReplyAllReminder.CheckReplyAll Item, Cancel
+End Sub
