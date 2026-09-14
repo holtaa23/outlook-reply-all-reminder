@@ -91,7 +91,7 @@ Edit `manifest.xml` and replace every occurrence of
 `https://REPLACE-ME.example.com/` with your base URL (keep the trailing slash).
 
 ```bash
-sed -i 's#https://REPLACE-ME.example.com/#https://YOURUSER.github.io/YOURREPO/#g' manifest.xml
+sed -i 's#https://REPLACE-ME.example.com/#https://holtaa23.github.io/outlook-reply-all-reminder/#g' manifest.xml
 ```
 
 ### 3. Set your addresses
