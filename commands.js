@@ -13,6 +13,12 @@
 /* ------------------------------------------------------------------ */
 
 var CONFIG = {
+  // TEMPORARY. When true, every reply prompts with what the handler actually
+  // saw, instead of only prompting when someone would be dropped. Use it to
+  // prove the add-in is installed and the send event fires. Set back to false
+  // once that is confirmed.
+  diagnostic: true,
+
   // Your own addresses. You are never counted as a "dropped" recipient.
   // Add every alias you receive mail at.
   myAddresses: [
@@ -48,21 +54,27 @@ function onMessageSendHandler(event) {
   var bodyText = "";
 
   function finish() {
+    var block = null, original = [], dropped = [];
+
     try {
-      // Only interested in Reply. Reply All and new mail are fine, and a
-      // deliberately trimmed Reply All is the user's own decision.
-      if (composeType !== "reply") return allow(event);
+      block = extractHeaderBlock(bodyText);
+      original = block ? parseParticipants(block) : [];
 
-      var block = extractHeaderBlock(bodyText);
-      if (!block) return allow(event);
-
-      var original = parseParticipants(block);
-      if (!original.length) return allow(event);
-
-      var dropped = original.filter(function (p) {
+      dropped = original.filter(function (p) {
         return !isMe(p) && !isIgnored(p) && !isAlreadyIncluded(p, currentRecipients);
       });
 
+      if (CONFIG.diagnostic) {
+        return event.completed({
+          allowEvent: false,
+          errorMessage: buildDiagnostic(composeType, currentRecipients, bodyText, block, original, dropped)
+        });
+      }
+
+      // Only interested in Reply. Reply All and new mail are fine, and a
+      // deliberately trimmed Reply All is the user's own decision.
+      if (composeType !== "reply") return allow(event);
+      if (!block || !original.length) return allow(event);
       if (dropped.length < CONFIG.minDropped) return allow(event);
 
       event.completed({
@@ -70,6 +82,12 @@ function onMessageSendHandler(event) {
         errorMessage: buildWarning(dropped)
       });
     } catch (e) {
+      if (CONFIG.diagnostic) {
+        return event.completed({
+          allowEvent: false,
+          errorMessage: "DIAG threw: " + String(e && e.message ? e.message : e).slice(0, 110)
+        });
+      }
       // Never let a bug in here block a send.
       allow(event);
     }
@@ -297,6 +315,35 @@ function matchesLabel(line, labels) {
 function stripLabel(line) {
   var i = line.indexOf(":");
   return i >= 0 && labelOf(line) !== null ? line.slice(i + 1).trim() : line.trim();
+}
+
+/*
+ * Temporary. Reports what the handler actually received, so a single test
+ * send distinguishes "add-in never ran" from "ran but found no quoted
+ * header block" - the two failure modes look identical from outside.
+ *   ct   = compose type Outlook reported
+ *   rcp  = recipients on the reply right now
+ *   body = characters of body text the handler got back
+ *   hdr  = was a quoted From/To/Cc block found
+ *   par  = participants parsed out of it
+ *   drop = how many would be dropped
+ */
+function buildDiagnostic(composeType, recipients, bodyText, block, original, dropped) {
+  var names = dropped
+    .map(function (p) { return p.name || p.email; })
+    .filter(Boolean)
+    .join(",");
+
+  var msg =
+    "DIAG ct=" + (composeType || "?") +
+    " rcp=" + recipients.length +
+    " body=" + (bodyText || "").length +
+    " hdr=" + (block ? "Y" + block.length : "N") +
+    " par=" + original.length +
+    " drop=" + dropped.length +
+    (names ? " [" + names + "]" : "");
+
+  return msg.length > 140 ? msg.slice(0, 137) + "..." : msg;
 }
 
 function buildWarning(dropped) {
