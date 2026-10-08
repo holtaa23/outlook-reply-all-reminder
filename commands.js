@@ -1,42 +1,59 @@
 /*
  * Reply-All Reminder for new Outlook / Outlook on the web
  * -------------------------------------------------------
- * Fires on Send. If you used Reply (not Reply All) on a message that had
- * other recipients, it warns you and lists who is about to be dropped.
+ * Fires on Send. If you used Reply on a message that had other recipients,
+ * it warns you and names who is about to be dropped from the thread.
  *
- * Everything runs locally in the add-in runtime. No network calls, no
- * account permissions beyond reading the message you are composing.
+ * It asks Microsoft Graph for the ORIGINAL message and reads its real To and
+ * Cc lists. That is the whole point of this version: the previous one parsed
+ * the quoted "From:/To:/Cc:" block out of the reply body, and new Outlook
+ * threads replies instead of inlining that block, so there was often nothing
+ * there to read.
+ *
+ * The body parser is kept only as a fallback for when Graph is unreachable
+ * (offline, token expired, classic Outlook's JavaScript-only runtime where
+ * MSAL cannot load). Graph always wins when both are available. Set
+ * CONFIG.useBodyFallback to false to turn the fallback off entirely.
+ *
+ * SETUP: CONFIG.clientId below must hold the Application (client) ID of the
+ * Azure app registration. Until it does, this falls back to body parsing.
  */
 
 /* ------------------------------------------------------------------ */
-/* CONFIG - edit these                                                 */
+/* CONFIG                                                              */
 /* ------------------------------------------------------------------ */
 
 var CONFIG = {
-  // TEMPORARY. When true, every reply prompts with what the handler actually
-  // saw, instead of only prompting when someone would be dropped. Use it to
-  // prove the add-in is installed and the send event fires. Set back to false
-  // once that is confirmed.
+  // Application (client) ID from the Azure app registration.
+  clientId: "PASTE_AZURE_CLIENT_ID_HERE",
+
+  // Permission asked of Graph. Mail.Read is the narrowest that can read the
+  // original message's recipients. Delegated - it can only ever see mail the
+  // signed-in user can already see.
+  graphScopes: ["Mail.Read"],
+
+  // Give up on Graph after this long and fall back. The send is blocked while
+  // this runs, so it has to stay short.
+  graphTimeoutMs: 4000,
+
+  // Read the quoted header block when Graph is unavailable.
+  useBodyFallback: true,
+
+  // TEMPORARY. Prompts on every reply with what the handler actually saw,
+  // including which source the data came from. Set to false for normal use.
   diagnostic: true,
 
-  // Your own addresses. You are never counted as a "dropped" recipient.
-  // Add every alias you receive mail at.
-  myAddresses: [
-    // "aaron@example.com",
-  ],
+  // Extra addresses that count as "you". Your primary mailbox address is
+  // detected automatically; add aliases here.
+  myAddresses: [],
 
   // Never warn about these addresses or domain fragments.
-  ignore: [
-    "noreply@",
-    "no-reply@",
-    "donotreply@"
-  ],
+  ignore: ["noreply@", "no-reply@", "donotreply@"],
 
   // Warn only when at least this many people would be left out.
   minDropped: 1,
 
-  // Header labels used to find the To/Cc lines in the quoted original.
-  // Detection still works without a label match - these just improve it.
+  // Header labels, used only by the body-parsing fallback.
   toLabels: ["to", "an", "a", "para", "aan", "til", "till", "kenelle", "do", "komu"],
   ccLabels: ["cc", "copy", "kopie", "copia", "kopia"],
   fromLabels: ["from", "von", "de", "da", "van", "fran", "fra", "lahettaja", "od"],
@@ -44,78 +61,70 @@ var CONFIG = {
   subjectLabels: ["subject", "betreff", "objet", "asunto", "oggetto", "onderwerp", "amne", "emne", "aihe", "temat"]
 };
 
+var GRAPH_ROOT = "https://graph.microsoft.com/v1.0";
+
+/* Reused across sends within one runtime lifetime. The runtime is short-lived,
+ * so this helps on a burst of replies rather than across a whole session. */
+var msalInstance = null;
+
 /* ------------------------------------------------------------------ */
 /* Entry point                                                         */
 /* ------------------------------------------------------------------ */
 
 function onMessageSendHandler(event) {
-  var composeType = null;
-  var currentRecipients = [];
-  var bodyText = "";
+  var item = Office.context.mailbox.item;
+  var state = { source: "none", error: "" };
 
-  function finish() {
-    var block = null, original = [], dropped = [];
+  // Office.onReady does not run for event handlers, so everything starts here.
+  Promise.all([
+    getComposeType(item),
+    getAllRecipients(item),
+    getBodyText(item)
+  ])
+    .then(function (results) {
+      state.composeType = results[0];
+      state.recipients = results[1];
+      state.bodyText = results[2];
 
-    try {
-      block = extractHeaderBlock(bodyText);
-      original = block ? parseParticipants(block) : [];
+      return getOriginalParticipants(item, state);
+    })
+    .then(function (original) {
+      state.original = original || [];
 
-      dropped = original.filter(function (p) {
-        return !isMe(p) && !isIgnored(p) && !isAlreadyIncluded(p, currentRecipients);
+      state.dropped = state.original.filter(function (p) {
+        return !isMe(p) && !isIgnored(p) && !isAlreadyIncluded(p, state.recipients);
       });
 
+      decide(event, state);
+    })
+    .catch(function (e) {
+      state.error = String((e && e.message) || e).slice(0, 80);
       if (CONFIG.diagnostic) {
         return event.completed({
           allowEvent: false,
-          errorMessage: buildDiagnostic(composeType, currentRecipients, bodyText, block, original, dropped)
+          errorMessage: "DIAG threw: " + state.error
         });
       }
-
-      // Only interested in Reply. Reply All and new mail are fine, and a
-      // deliberately trimmed Reply All is the user's own decision.
-      if (composeType !== "reply") return allow(event);
-      if (!block || !original.length) return allow(event);
-      if (dropped.length < CONFIG.minDropped) return allow(event);
-
-      event.completed({
-        allowEvent: false,
-        errorMessage: buildWarning(dropped)
-      });
-    } catch (e) {
-      if (CONFIG.diagnostic) {
-        return event.completed({
-          allowEvent: false,
-          errorMessage: "DIAG threw: " + String(e && e.message ? e.message : e).slice(0, 110)
-        });
-      }
-      // Never let a bug in here block a send.
+      // Never block a send because this add-in failed.
       allow(event);
-    }
+    });
+}
+
+function decide(event, state) {
+  if (CONFIG.diagnostic) {
+    return event.completed({
+      allowEvent: false,
+      errorMessage: buildDiagnostic(state)
+    });
   }
 
-  // Three independent lookups. Fire them together, join on a counter.
-  var pending = 3;
-  function step() { if (--pending === 0) finish(); }
+  // Only Reply is interesting. A trimmed Reply All is a deliberate choice.
+  if (state.composeType !== "reply") return allow(event);
+  if (state.dropped.length < CONFIG.minDropped) return allow(event);
 
-  var item = Office.context.mailbox.item;
-
-  item.getComposeTypeAsync(function (r) {
-    if (r.status === Office.AsyncResultStatus.Succeeded && r.value) {
-      composeType = r.value.composeType;
-    }
-    step();
-  });
-
-  item.body.getAsync(Office.CoercionType.Text, function (r) {
-    if (r.status === Office.AsyncResultStatus.Succeeded) {
-      bodyText = r.value || "";
-    }
-    step();
-  });
-
-  getAllRecipients(item, function (list) {
-    currentRecipients = list;
-    step();
+  event.completed({
+    allowEvent: false,
+    errorMessage: buildWarning(state.dropped)
   });
 }
 
@@ -124,83 +133,212 @@ function allow(event) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Current recipients                                                  */
+/* The original message's recipients - Graph first, body as fallback   */
 /* ------------------------------------------------------------------ */
 
-function getAllRecipients(item, callback) {
-  var out = [];
-  var pending = 3;
-  function step() { if (--pending === 0) callback(out); }
+function getOriginalParticipants(item, state) {
+  return fromGraph(item, state)
+    .then(function (people) {
+      if (people && people.length) {
+        state.source = "graph";
+        return people;
+      }
+      return fromBody(state);
+    })
+    .catch(function (e) {
+      state.error = String((e && e.message) || e).slice(0, 60);
+      return fromBody(state);
+    });
+}
 
-  function collect(result) {
-    if (result.status === Office.AsyncResultStatus.Succeeded && result.value) {
-      result.value.forEach(function (r) {
-        out.push({ email: norm(r.emailAddress), name: norm(r.displayName) });
-      });
-    }
-    step();
+function fromBody(state) {
+  if (!CONFIG.useBodyFallback) return [];
+
+  var block = extractHeaderBlock(state.bodyText || "");
+  if (!block) return [];
+
+  var people = parseParticipants(block);
+  if (people.length) state.source = "body";
+  return people;
+}
+
+/*
+ * Ask Graph for the messages in this conversation and read the real To/Cc off
+ * the most recent one that isn't the draft being composed.
+ */
+function fromGraph(item, state) {
+  var conversationId = item.conversationId;
+
+  if (!conversationId) return Promise.resolve([]);
+  if (!CONFIG.clientId || CONFIG.clientId.indexOf("PASTE_") === 0) {
+    state.error = "no clientId";
+    return Promise.resolve([]);
   }
 
-  item.to.getAsync(collect);
-  item.cc.getAsync(collect);
-  item.bcc.getAsync(collect);
+  return withTimeout(
+    getGraphToken().then(function (token) {
+      var url =
+        GRAPH_ROOT +
+        "/me/messages?$filter=conversationId eq '" +
+        encodeURIComponent(conversationId) +
+        "'&$select=from,toRecipients,ccRecipients,receivedDateTime,isDraft&$top=25";
+
+      return fetch(url, {
+        headers: { Authorization: "Bearer " + token }
+      }).then(function (res) {
+        if (!res.ok) throw new Error("graph " + res.status);
+        return res.json();
+      });
+    }),
+    CONFIG.graphTimeoutMs
+  ).then(function (data) {
+    var messages = (data && data.value) || [];
+
+    var original = messages
+      .filter(function (m) { return !m.isDraft && m.receivedDateTime; })
+      .sort(function (a, b) {
+        return new Date(b.receivedDateTime) - new Date(a.receivedDateTime);
+      })[0];
+
+    if (!original) return [];
+
+    // The sender is already the To: of your reply, so only To and Cc matter.
+    return dedupe(
+      []
+        .concat(original.toRecipients || [], original.ccRecipients || [])
+        .map(function (r) {
+          var a = (r && r.emailAddress) || {};
+          return { email: norm(a.address), name: norm(a.name) };
+        })
+        .filter(function (p) { return p.email || p.name; })
+    );
+  });
+}
+
+function getGraphToken() {
+  return initMsal().then(function (instance) {
+    var accounts = instance.getAllAccounts();
+    var request = { scopes: CONFIG.graphScopes };
+    if (accounts && accounts.length) request.account = accounts[0];
+
+    // Silent only. An interactive popup in the middle of a send would be
+    // hostile, and may not be permitted from the event runtime at all.
+    return instance.acquireTokenSilent(request).then(function (result) {
+      return result.accessToken;
+    });
+  });
+}
+
+function initMsal() {
+  if (msalInstance) return Promise.resolve(msalInstance);
+
+  // MSAL is loaded as a global by commands.html. In classic Outlook's
+  // JavaScript-only runtime there is no page, so this will be undefined and
+  // we fall back to body parsing.
+  if (typeof msal === "undefined" || !msal.createNestablePublicClientApplication) {
+    return Promise.reject(new Error("msal unavailable"));
+  }
+
+  return msal
+    .createNestablePublicClientApplication({
+      auth: {
+        clientId: CONFIG.clientId,
+        authority: "https://login.microsoftonline.com/common"
+      },
+      cache: { cacheLocation: "localStorage" }
+    })
+    .then(function (instance) {
+      msalInstance = instance;
+      return instance;
+    });
+}
+
+function withTimeout(promise, ms) {
+  return Promise.race([
+    promise,
+    new Promise(function (_, reject) {
+      setTimeout(function () { reject(new Error("timeout")); }, ms);
+    })
+  ]);
 }
 
 /* ------------------------------------------------------------------ */
-/* Quoted-original parsing                                             */
+/* Office.js wrappers                                                  */
 /* ------------------------------------------------------------------ */
 
-/*
- * Pull out the header block of the most recent quoted message - the
- * From/Sent/To/Cc/Subject lines Outlook inserts above the quoted text.
- * Returns an array of lines, or null.
- */
+function getComposeType(item) {
+  return new Promise(function (resolve) {
+    if (!item.getComposeTypeAsync) return resolve(null);
+    item.getComposeTypeAsync(function (r) {
+      resolve(r.status === Office.AsyncResultStatus.Succeeded && r.value
+        ? r.value.composeType
+        : null);
+    });
+  });
+}
+
+function getBodyText(item) {
+  return new Promise(function (resolve) {
+    item.body.getAsync(Office.CoercionType.Text, function (r) {
+      resolve(r.status === Office.AsyncResultStatus.Succeeded ? r.value || "" : "");
+    });
+  });
+}
+
+function getAllRecipients(item) {
+  function read(field) {
+    return new Promise(function (resolve) {
+      field.getAsync(function (r) {
+        resolve(r.status === Office.AsyncResultStatus.Succeeded && r.value ? r.value : []);
+      });
+    });
+  }
+
+  return Promise.all([read(item.to), read(item.cc), read(item.bcc)]).then(function (lists) {
+    return [].concat(lists[0], lists[1], lists[2]).map(function (r) {
+      return { email: norm(r.emailAddress), name: norm(r.displayName) };
+    });
+  });
+}
+
+/* ------------------------------------------------------------------ */
+/* Body-parsing fallback                                               */
+/* ------------------------------------------------------------------ */
+
 function extractHeaderBlock(body) {
   var lines = body.split(/\r?\n/);
+  var block;
 
   for (var i = 0; i < lines.length; i++) {
     if (!matchesLabel(lines[i], CONFIG.fromLabels)) continue;
 
-    var block = [];
+    block = [];
     var end = Math.min(i + 10, lines.length);
     for (var j = i; j < end; j++) {
-      var line = lines[j];
-      // A blank line ends the block, but only once we have a couple of lines.
-      if (!line.trim() && block.length >= 2) break;
-      block.push(line);
-      if (matchesLabel(line, CONFIG.subjectLabels)) break;
+      if (!lines[j].trim() && block.length >= 2) break;
+      block.push(lines[j]);
+      if (matchesLabel(lines[j], CONFIG.subjectLabels)) break;
     }
     return block.length >= 2 ? block : null;
   }
   return null;
 }
 
-/*
- * Participants of the original message, excluding its sender (who is
- * already the To: of your reply).
- */
 function parseParticipants(block) {
   var out = [];
 
   block.forEach(function (line, idx) {
-    if (idx === 0) return;                                 // From line
-    if (matchesLabel(line, CONFIG.subjectLabels)) return;  // Subject line
+    if (idx === 0) return;
+    if (matchesLabel(line, CONFIG.subjectLabels)) return;
     if (matchesLabel(line, CONFIG.fromLabels)) return;
-    if (matchesLabel(line, CONFIG.sentLabels)) return;     // Sent/Date line
+    if (matchesLabel(line, CONFIG.sentLabels)) return;
 
-    var isLabelled =
+    var labelled =
       matchesLabel(line, CONFIG.toLabels) || matchesLabel(line, CONFIG.ccLabels);
-
     var entries = splitEntries(stripLabel(line));
 
-    // A date line in an unrecognised locale would otherwise read as two
-    // name-like tokens. Nothing with a year or a clock time is a recipient.
-    if (!isLabelled && looksLikeTimestamp(line)) return;
-
-    // A labelled To/Cc line is trusted outright. An unlabelled line counts
-    // only if it actually reads like a recipient list - that is what keeps
-    // non-English clients working without any config.
-    if (!isLabelled && !looksLikeRecipientList(entries)) return;
+    if (!labelled && looksLikeTimestamp(line)) return;
+    if (!labelled && !looksLikeRecipientList(entries)) return;
 
     entries.forEach(function (e) {
       var p = parseEntry(e);
@@ -212,7 +350,6 @@ function parseParticipants(block) {
 }
 
 function splitEntries(value) {
-  // ';' always separates. ',' only separates outside an <...> address.
   return value
     .split(/;|,(?![^<]*>)/)
     .map(function (s) { return s.trim(); })
@@ -231,19 +368,16 @@ function parseEntry(entry) {
   var bare = entry.match(/[^\s<>()[\],;:]+@[^\s<>()[\],;:]+\.[A-Za-z]{2,}/);
   if (bare) return { email: norm(bare[0]), name: "" };
 
-  // Display name only - common for internal Exchange recipients.
   if (entry.length >= 2 && entry.length <= 80 && entry.indexOf("@") === -1 && /[A-Za-z]/.test(entry)) {
     return { email: "", name: norm(entry.replace(/["']/g, "")) };
   }
   return null;
 }
 
-/* A 4-digit year or a clock time means this is a date line, not recipients. */
 function looksLikeTimestamp(line) {
   return /\b\d{4}\b/.test(line) || /\b\d{1,2}[:.]\d{2}\b/.test(line);
 }
 
-/* Two or more entries that each read like a person or an address. */
 function looksLikeRecipientList(entries) {
   if (entries.length < 2) return false;
   var plausible = entries.filter(function (e) {
@@ -259,7 +393,7 @@ function looksLikeRecipientList(entries) {
 
 function isMe(p) {
   var mine = CONFIG.myAddresses.map(norm);
-  var profile = Office.context.mailbox.userProfile || {};
+  var profile = (Office.context.mailbox && Office.context.mailbox.userProfile) || {};
   var box = norm(profile.emailAddress);
   var display = norm(profile.displayName);
 
@@ -276,7 +410,7 @@ function isIgnored(p) {
 }
 
 function isAlreadyIncluded(p, recipients) {
-  return recipients.some(function (r) {
+  return (recipients || []).some(function (r) {
     if (p.email && r.email) return p.email === r.email;
     if (p.name && r.name) return p.name === r.name;
     return false;
@@ -317,30 +451,19 @@ function stripLabel(line) {
   return i >= 0 && labelOf(line) !== null ? line.slice(i + 1).trim() : line.trim();
 }
 
-/*
- * Temporary. Reports what the handler actually received, so a single test
- * send distinguishes "add-in never ran" from "ran but found no quoted
- * header block" - the two failure modes look identical from outside.
- *   ct   = compose type Outlook reported
- *   rcp  = recipients on the reply right now
- *   body = characters of body text the handler got back
- *   hdr  = was a quoted From/To/Cc block found
- *   par  = participants parsed out of it
- *   drop = how many would be dropped
- */
-function buildDiagnostic(composeType, recipients, bodyText, block, original, dropped) {
-  var names = dropped
+function buildDiagnostic(state) {
+  var names = (state.dropped || [])
     .map(function (p) { return p.name || p.email; })
     .filter(Boolean)
     .join(",");
 
   var msg =
-    "DIAG ct=" + (composeType || "?") +
-    " rcp=" + recipients.length +
-    " body=" + (bodyText || "").length +
-    " hdr=" + (block ? "Y" + block.length : "N") +
-    " par=" + original.length +
-    " drop=" + dropped.length +
+    "DIAG src=" + state.source +
+    " ct=" + (state.composeType || "?") +
+    " rcp=" + ((state.recipients || []).length) +
+    " orig=" + ((state.original || []).length) +
+    " drop=" + ((state.dropped || []).length) +
+    (state.error ? " err=" + state.error : "") +
     (names ? " [" + names + "]" : "");
 
   return msg.length > 140 ? msg.slice(0, 137) + "..." : msg;
@@ -361,8 +484,6 @@ function buildWarning(dropped) {
 /* ------------------------------------------------------------------ */
 /* Registration                                                        */
 /* ------------------------------------------------------------------ */
-
-Office.onReady();
 
 if (typeof Office !== "undefined" && Office.actions) {
   Office.actions.associate("onMessageSendHandler", onMessageSendHandler);

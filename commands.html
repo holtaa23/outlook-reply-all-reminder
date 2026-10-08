@@ -4,13 +4,23 @@
   <meta charset="UTF-8" />
   <meta http-equiv="X-UA-Compatible" content="IE=edge" />
   <title>Reply-All Reminder</title>
+
+  <!--
+    Never displayed. This page exists only to host the send handler's runtime
+    in new Outlook and Outlook on the web.
+
+    Load order matters: Office.js first, then MSAL (which defines the global
+    `msal`), then the handler, which registers itself at the end of its file.
+
+    MSAL is pinned to an exact version deliberately. A floating major would let
+    a breaking change reach the add-in without anyone touching this repo, and
+    the only symptom would be replies quietly losing their Graph lookup and
+    falling back to the weaker body parser.
+  -->
   <script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@azure/msal-browser@5.25.0/lib/msal-browser.min.js"></script>
   <script src="commands.js"></script>
 </head>
 <body>
-  <!--
-    Never shown. Outlook on the web falls back to this page when it cannot
-    use the JS-only runtime; the handler is registered by commands.js either way.
-  -->
 </body>
 </html>
